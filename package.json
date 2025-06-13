@@ -1,10 +1,11 @@
 {
   "name": "pixperfect-backend",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "npm install"
+    "start": "node index.js",
+    "build": "npm install",
+    "preinstall": "npm install --build-from-source sqlite3"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
@@ -16,7 +17,10 @@
     "sharp": "^0.34.2",
     "sqlite3": "^5.1.7"
   },
+  "devDependencies": {
+    "@mapbox/node-pre-gyp": "^1.0.11"
+  },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "20.x"
   }
 }
