@@ -1,9 +1,9 @@
 {
   "name": "pixperfect-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node server.js",
     "build": "npm install",
     "preinstall": "npm install --build-from-source sqlite3"
   },
