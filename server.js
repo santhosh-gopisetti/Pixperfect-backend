@@ -12,19 +12,20 @@ const sharp = require('sharp');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET || 'temporary-secret-for-testing'; // Fallback for demo
 
 // Middleware
 app.use(express.json());
 app.use(cors({
-  origin: 'http://localhost:5173',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'], // Added PUT
+  origin: 'https://pixperfectfrontend.netlify.app',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.use('/uploads', express.static('uploads'));
+app.use('/uploads', express.static('Uploads'));
 
-// Database setup
-const dbPath = path.join(__dirname, 'pixperfect.db');
+// Database setup (in-memory for demo)
+const dbPath = process.env.DATABASE_URL || ':memory:';
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Database connection error:', err.message);
@@ -64,7 +65,7 @@ db.serialize(() => {
 // Multer setup for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, 'uploads');
+    const uploadDir = path.join(__dirname, 'Uploads');
     if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
     cb(null, uploadDir);
   },
@@ -141,7 +142,7 @@ app.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' }); // Extended to 24h for testing
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' });
     console.log('Login successful for username:', username);
     res.json({ token });
   } catch (err) {
@@ -176,7 +177,7 @@ app.post('/rotate', authenticateToken, upload.single('image'), async (req, res) 
   const userId = req.user.id;
   const inputPath = req.file.path;
   const outputFilename = `rotated-${Date.now()}.png`;
-  const outputPath = path.join(__dirname, 'uploads', outputFilename); // Fixed directory name
+  const outputPath = path.join(__dirname, 'Uploads', outputFilename);
 
   try {
     console.log('Starting rotation:', { degrees, inputPath });
@@ -191,7 +192,7 @@ app.post('/rotate', authenticateToken, upload.single('image'), async (req, res) 
     });
 
     // Save to database
-    const imagePath = `/uploads/${outputFilename}`; // Fixed path
+    const imagePath = `/Uploads/${outputFilename}`;
     await dbRun(
       'INSERT INTO images (userId, imagePath, overlayProps, textOverlay, createdAt) VALUES (?, ?, ?, ?, ?)',
       [userId, imagePath, JSON.stringify({ x: 50, y: 50, scale: 1, opacity: 1.0, dragging: false }), JSON.stringify({ content: "", font: "Arial", size: 20, color: "#ffffff", x: 50, y: 50, opacity: 1.0, dragging: false }), new Date().toISOString()]
@@ -214,7 +215,7 @@ app.post('/flip', authenticateToken, upload.single('image'), async (req, res) =>
   const userId = req.user.id;
   const inputPath = req.file.path;
   const outputFilename = `flipped-${Date.now()}.png`;
-  const outputPath = path.join(__dirname, 'uploads', outputFilename); // Fixed directory name
+  const outputPath = path.join(__dirname, 'Uploads', outputFilename);
 
   try {
     console.log('Starting flip:', { direction, inputPath });
@@ -234,7 +235,7 @@ app.post('/flip', authenticateToken, upload.single('image'), async (req, res) =>
     });
 
     // Save to database
-    const imagePath = `/uploads/${outputFilename}`; // Fixed path
+    const imagePath = `/Uploads/${outputFilename}`;
     await dbRun(
       'INSERT INTO images (userId, imagePath, overlayProps, textOverlay, createdAt) VALUES (?, ?, ?, ?, ?)',
       [userId, imagePath, JSON.stringify({ x: 50, y: 50, scale: 1, opacity: 1.0, dragging: false }), JSON.stringify({ content: "", font: "Arial", size: 20, color: "#ffffff", x: 50, y: 50, opacity: 1.0, dragging: false }), new Date().toISOString()]
@@ -251,11 +252,11 @@ app.post('/flip', authenticateToken, upload.single('image'), async (req, res) =>
   }
 });
 
-// Update image endpoint (Added)
+// Update image endpoint
 app.put('/image', authenticateToken, upload.single('image'), async (req, res) => {
   const { id, overlayProps, textOverlay } = req.body;
   const userId = req.user.id;
-  const newImagePath = `/uploads/${req.file.filename}`;
+  const newImagePath = `/Uploads/${req.file.filename}`;
 
   try {
     // Check if the image exists and belongs to the user
