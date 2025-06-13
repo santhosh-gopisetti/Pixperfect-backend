@@ -9,29 +9,21 @@ const fs = require('fs');
 const path = require('path');
 const util = require('util');
 const sharp = require('sharp');
-const AWS = require('aws-sdk');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// Configure AWS S3
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION,
-});
-const S3_BUCKET = process.env.S3_BUCKET;
-
 // Middleware
 app.use(express.json());
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://your-frontend.onrender.com'], // Add frontend URL after deployment
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  origin: 'http://localhost:5173',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'], // Added PUT
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+app.use('/uploads', express.static('uploads'));
 
-// Database setup (SQLite remains unchanged)
+// Database setup
 const dbPath = path.join(__dirname, 'pixperfect.db');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
@@ -41,7 +33,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
   console.log('Connected to SQLite database at', dbPath);
 });
 
-// Promisify SQLite methods
+// Promisify SQLite methods for async/await
 const dbRun = util.promisify(db.run.bind(db));
 const dbGet = util.promisify(db.get.bind(db));
 const dbAll = util.promisify(db.all.bind(db));
@@ -69,17 +61,27 @@ db.serialize(() => {
   console.log('Tables created');
 });
 
-// Multer setup for in-memory storage (before uploading to S3)
-const storage = multer.memoryStorage();
+// Multer setup for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  },
+});
 const upload = multer({ storage });
 
-// Authentication middleware (unchanged)
+// Authentication middleware
 const authenticateToken = (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) {
     console.log('Authentication failed: No token provided');
     return res.status(401).json({ error: 'No token provided' });
   }
+
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       console.log('Authentication failed: Invalid token', err.message);
@@ -91,70 +93,105 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// Upload endpoint (modified for S3)
+// Signup endpoint
+app.post('/signup', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be 6 characters long' });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await dbRun('INSERT INTO users (username, password) VALUES (?, ?)', [username, hashedPassword]);
+    const user = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    console.log('User registered:', { id: user.id, username: user.username });
+    res.json({ message: 'User created successfully' });
+  } catch (err) {
+    console.error('Signup error:', err.message);
+    if (err.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({ error: 'Username already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create user' });
+  }
+});
+
+// Login endpoint
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be 6 characters long' });
+  }
+
+  try {
+    const user = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    if (!user) {
+      console.log('Login failed: User not found for username:', username);
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      console.log('Login failed: Password mismatch for username:', username);
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '24h' }); // Extended to 24h for testing
+    console.log('Login successful for username:', username);
+    res.json({ token });
+  } catch (err) {
+    console.error('Login error:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Upload endpoint
 app.post('/upload', authenticateToken, upload.single('image'), async (req, res) => {
   const { overlayProps, textOverlay } = req.body;
   const userId = req.user.id;
-  const file = req.file;
-
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  const fileName = `${Date.now()}-${file.originalname}`;
-  const params = {
-    Bucket: S3_BUCKET,
-    Key: `uploads/${fileName}`,
-    Body: file.buffer,
-    ContentType: file.mimetype,
-    ACL: 'public-read',
-  };
+  const imagePath = `/uploads/${req.file.filename}`;
 
   try {
-    const { Location } = await s3.upload(params).promise();
-    const imagePath = Location; // S3 URL
-
     await dbRun(
       'INSERT INTO images (userId, imagePath, overlayProps, textOverlay, createdAt) VALUES (?, ?, ?, ?, ?)',
       [userId, imagePath, overlayProps, textOverlay, new Date().toISOString()]
     );
     const imageId = (await dbGet('SELECT last_insert_rowid() as id')).id;
-    console.log('Image uploaded to S3:', { imageId, imagePath, userId });
+    console.log('Image uploaded:', { imageId, imagePath, userId });
     res.json({ imageId, imagePath, message: 'Image uploaded successfully' });
   } catch (err) {
     console.error('Upload error:', err.message);
-    res.status(500).json({ error: 'Failed to upload image' });
+    res.status(500).json({ error: 'Failed to save image' });
   }
 });
 
-// Rotate endpoint (modified for S3)
+// Rotate endpoint
 app.post('/rotate', authenticateToken, upload.single('image'), async (req, res) => {
   const { degrees } = req.body;
   const userId = req.user.id;
-  const file = req.file;
-
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
+  const inputPath = req.file.path;
   const outputFilename = `rotated-${Date.now()}.png`;
+  const outputPath = path.join(__dirname, 'uploads', outputFilename); // Fixed directory name
+
   try {
-    console.log('Starting rotation:', { degrees });
-    const rotatedBuffer = await sharp(file.buffer)
+    console.log('Starting rotation:', { degrees, inputPath });
+    await sharp(inputPath)
       .rotate(parseInt(degrees))
-      .toBuffer();
+      .toFile(outputPath);
+    console.log('Rotation completed:', { outputPath });
 
-    const params = {
-      Bucket: S3_BUCKET,
-      Key: `uploads/${outputFilename}`,
-      Body: rotatedBuffer,
-      ContentType: 'image/png',
-      ACL: 'public-read',
-    };
+    // Clean up input file
+    fs.unlink(inputPath, (err) => {
+      if (err) console.error('Failed to delete input file:', err);
+    });
 
-    const { Location } = await s3.upload(params).promise();
-    const imagePath = Location;
-
+    // Save to database
+    const imagePath = `/uploads/${outputFilename}`; // Fixed path
     await dbRun(
       'INSERT INTO images (userId, imagePath, overlayProps, textOverlay, createdAt) VALUES (?, ?, ?, ?, ?)',
       [userId, imagePath, JSON.stringify({ x: 50, y: 50, scale: 1, opacity: 1.0, dragging: false }), JSON.stringify({ content: "", font: "Arial", size: 20, color: "#ffffff", x: 50, y: 50, opacity: 1.0, dragging: false }), new Date().toISOString()]
@@ -164,44 +201,40 @@ app.post('/rotate', authenticateToken, upload.single('image'), async (req, res) 
     res.json({ imageId, imagePath, message: 'Image rotated successfully' });
   } catch (err) {
     console.error('Rotation error:', err.message);
+    fs.unlink(inputPath, (err) => {
+      if (err) console.error('Failed to delete input file:', err);
+    });
     res.status(500).json({ error: 'Failed to rotate image' });
   }
 });
 
-// Flip endpoint (modified for S3)
+// Flip endpoint
 app.post('/flip', authenticateToken, upload.single('image'), async (req, res) => {
   const { direction } = req.body;
   const userId = req.user.id;
-  const file = req.file;
-
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
+  const inputPath = req.file.path;
   const outputFilename = `flipped-${Date.now()}.png`;
+  const outputPath = path.join(__dirname, 'uploads', outputFilename); // Fixed directory name
+
   try {
-    console.log('Starting flip:', { direction });
-    const sharpInstance = sharp(file.buffer);
+    console.log('Starting flip:', { direction, inputPath });
+    const sharpInstance = sharp(inputPath);
     if (direction === 'horizontal') {
-      await sharpInstance.flip();
+      await sharpInstance.flip().toFile(outputPath);
     } else if (direction === 'vertical') {
-      await sharpInstance.flop();
+      await sharpInstance.flop().toFile(outputPath);
     } else {
       throw new Error('Invalid direction');
     }
-    const flippedBuffer = await sharpInstance.toBuffer();
+    console.log('Flip completed:', { outputPath });
 
-    const params = {
-      Bucket: S3_BUCKET,
-      Key: `uploads/${outputFilename}`,
-      Body: flippedBuffer,
-      ContentType: 'image/png',
-      ACL: 'public-read',
-    };
+    // Clean up input file
+    fs.unlink(inputPath, (err) => {
+      if (err) console.error('Failed to delete input file:', err);
+    });
 
-    const { Location } = await s3.upload(params).promise();
-    const imagePath = Location;
-
+    // Save to database
+    const imagePath = `/uploads/${outputFilename}`; // Fixed path
     await dbRun(
       'INSERT INTO images (userId, imagePath, overlayProps, textOverlay, createdAt) VALUES (?, ?, ?, ?, ?)',
       [userId, imagePath, JSON.stringify({ x: 50, y: 50, scale: 1, opacity: 1.0, dragging: false }), JSON.stringify({ content: "", font: "Arial", size: 20, color: "#ffffff", x: 50, y: 50, opacity: 1.0, dragging: false }), new Date().toISOString()]
@@ -211,43 +244,33 @@ app.post('/flip', authenticateToken, upload.single('image'), async (req, res) =>
     res.json({ imageId, imagePath, message: 'Image flipped successfully' });
   } catch (err) {
     console.error('Flip error:', err.message);
+    fs.unlink(inputPath, (err) => {
+      if (err) console.error('Failed to delete input file:', err);
+    });
     res.status(500).json({ error: 'Failed to flip image' });
   }
 });
 
-// Update image endpoint (modified for S3)
+// Update image endpoint (Added)
 app.put('/image', authenticateToken, upload.single('image'), async (req, res) => {
   const { id, overlayProps, textOverlay } = req.body;
   const userId = req.user.id;
-  const file = req.file;
-
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  const newFileName = `${Date.now()}-${file.originalname}`;
-  const params = {
-    Bucket: S3_BUCKET,
-    Key: `uploads/${newFileName}`,
-    Body: file.buffer,
-    ContentType: file.mimetype,
-    ACL: 'public-read',
-  };
+  const newImagePath = `/uploads/${req.file.filename}`;
 
   try {
+    // Check if the image exists and belongs to the user
     const image = await dbGet('SELECT * FROM images WHERE id = ? AND userId = ?', [id, userId]);
     if (!image) {
       return res.status(404).json({ error: 'Image not found or not authorized' });
     }
 
-    // Delete old image from S3
-    const oldKey = image.imagePath.split('/').pop();
-    await s3.deleteObject({ Bucket: S3_BUCKET, Key: `uploads/${oldKey}` }).promise();
+    // Delete the old image file
+    const oldFilePath = path.join(__dirname, image.imagePath);
+    fs.unlink(oldFilePath, (err) => {
+      if (err) console.error('Failed to delete old image file:', err);
+    });
 
-    // Upload new image
-    const { Location } = await s3.upload(params).promise();
-    const newImagePath = Location;
-
+    // Update the database with the new image path and properties
     await dbRun(
       'UPDATE images SET imagePath = ?, overlayProps = ?, textOverlay = ? WHERE id = ? AND userId = ?',
       [newImagePath, overlayProps, textOverlay, id, userId]
@@ -261,7 +284,38 @@ app.put('/image', authenticateToken, upload.single('image'), async (req, res) =>
   }
 });
 
-// Delete image endpoint (modified for S3)
+// Get all images for a user
+app.get('/images', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const rows = await dbAll('SELECT * FROM images WHERE userId = ?', [userId]);
+    console.log(`Fetched ${rows.length} images for user ${userId}`);
+    res.json(rows);
+  } catch (err) {
+    console.error('Fetch images error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch images' });
+  }
+});
+
+// Get a specific image
+app.get('/image/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  try {
+    const row = await dbGet('SELECT * FROM images WHERE id = ? AND userId = ?', [id, userId]);
+    if (!row) {
+      console.log(`Image not found: id=${id}, userId=${userId}`);
+      return res.status(404).json({ error: 'Image not found' });
+    }
+    console.log(`Fetched image: id=${id}, userId=${userId}`);
+    res.json(row);
+  } catch (err) {
+    console.error('Fetch image error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch image' });
+  }
+});
+
+// Delete an image
 app.delete('/image/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const userId = req.user.id;
@@ -273,9 +327,10 @@ app.delete('/image/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Image not found' });
     }
 
-    // Delete from S3
-    const key = row.imagePath.split('/').pop();
-    await s3.deleteObject({ Bucket: S3_BUCKET, Key: `Uploads/${key}` }).promise();
+    const filePath = path.join(__dirname, row.imagePath);
+    fs.unlink(filePath, (err) => {
+      if (err) console.error('Failed to delete file:', err);
+    });
 
     await dbRun('DELETE FROM images WHERE id = ? AND userId = ?', [id, userId]);
     console.log(`Image deleted: id=${id}, userId=${userId}`);
@@ -285,8 +340,6 @@ app.delete('/image/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to delete image' });
   }
 });
-
-// Other endpoints (signup, login, get images, etc.) remain unchanged
 
 // Root endpoint
 app.get('/', (req, res) => {
